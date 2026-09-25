@@ -2,15 +2,16 @@
 
 ProZorro MCP — Ukraine government procurement (keyless).
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1476+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
 | `prozorro_recent_tenders` | Most recently updated tenders from Ukraine's ProZorro national procurement system (via the keyless OpenProcurement public feed). Returns each tender with id, tenderID, title, value (amount+currency, usually UAH), buyer (procuring entity), status, and procurement method. Titles and buyer names are in Ukrainian. Use for browsing current Ukrainian public tenders; for a specific tender use prozorro_get_tender. |
-| `prozorro_search_tenders` | Keyword search over recent Ukraine ProZorro tenders (keyless OpenProcurement public feed). Best-effort: scans the recent public feed and returns tenders whose title/buyer/tenderID match the query (case-insensitive substring; Ukrainian text supported — pass Ukrainian keywords for best recall). Returns id, tenderID, title, value, buyer, status. NOTE: this is not a full-text index of all history — ProZorro's front-end search API is not reachable from datacenter egress, so this filters the recent feed only. For older or exact tenders use prozorro_get_tender with a known id. |
-| `prozorro_get_tender` | Full detail for a single Ukraine ProZorro tender by id (via the keyless OpenProcurement public API). Returns tenderID, title, description, status, procurement method, value (amount+currency), the buyer/procuring entity (name, EDR identifier, region, contact), tender period (start/end), enquiry period, number of bids, and line items (description, CPV classification, quantity, unit). Text is largely Ukrainian. Accepts the 32-char tender id from prozorro_recent_tenders / prozorro_search_tenders. |
+| `prozorro_search_tenders` | Full-text search over ALL Ukraine ProZorro tenders back to 2015 (keyless). Searches ProZorro's own analyzed index, so Ukrainian queries stem correctly ("школа" also matches "школи", "шкільний") — pass Ukrainian keywords for best recall. Filter by buyer EDRPOU, by SUPPLIER/bidder EDRPOU (`tenderer` — this is the one for supplier due diligence: every tender a company has bid on or won), CPV code, status, value range, and date. Returns tenderID, title, value, buyer name + EDRPOU + region, and status, plus a total match count. Use prozorro_get_tender for the full detail of one result. |
+| `prozorro_search_organizations` | Resolve a Ukrainian company or public buyer NAME to its EDRPOU code, using ProZorro's organization index (keyless). This is the entry point for supplier due diligence: a user knows the company's name, but prozorro_search_tenders filters by EDRPOU — call this first, then pass the returned `edrpou` as `tenderer` (supplier side) or `buyer` to get that company's full tender history. |
+| `prozorro_get_tender` | Full detail for a single Ukraine ProZorro tender by id (via the keyless OpenProcurement public API). Returns tenderID, title, description, status, procurement method, tender_value (the ORIGINAL ASKING PRICE — not money spent), the buyer/procuring entity (name, EDR identifier, region, contact), tender period (start/end), enquiry period, number of bids, line items (description, CPV classification, quantity, unit), and the OCDS award/contract stage: `award` (operative award: status, date, value, winning supplier — null if none) plus the full `awards` history, and `contract` (signed contract value/date). An `interpretation` line states plainly whether the tender_value was ever actually spent — a cancelled or unsuccessful tender still carries a populated tender_value even though zero money moved. Text is largely Ukrainian. Accepts the 32-char tender id from prozorro_recent_tenders / prozorro_search_tenders. |
 
 ## Quick Start
 
@@ -56,9 +57,45 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1476+ data sources. The
+Both URLs reach the same gateway and the same 1679+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
+
+## No MCP client? Call it over HTTP
+
+```bash
+curl -X POST https://gateway.pipeworx.io/v1/tools/prozorro_recent_tenders \
+  -H 'Content-Type: application/json' \
+  -d '{"limit":20}'
+```
+
+No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/prozorro_recent_tenders`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
+
+## Standalone (no gateway account)
+
+This package also runs as a local stdio MCP server — no Pipeworx account, no
+gateway round-trip:
+
+```json
+{
+  "mcpServers": {
+    "prozorro": {
+      "command": "npx",
+      "args": ["-y", "@pipeworx/mcp-prozorro"]
+    }
+  }
+}
+```
+
+Or run it directly to confirm it starts:
+
+```bash
+npx -y @pipeworx/mcp-prozorro
+```
+
+It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
+for **only** this pack's tools — none of the shared meta-tools the gateway
+connection above adds. Same source, same tools, no ask_pipeworx routing.
 
 ## Using with ask_pipeworx
 
@@ -79,13 +116,3 @@ The gateway picks the right tool and fills the arguments automatically.
 ## License
 
 MIT
-
-## No MCP client? Call it over HTTP
-
-```bash
-curl -X POST https://gateway.pipeworx.io/v1/tools/prozorro_recent_tenders \
-  -H 'Content-Type: application/json' \
-  -d '{"limit":20}'
-```
-
-No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/prozorro_recent_tenders`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
