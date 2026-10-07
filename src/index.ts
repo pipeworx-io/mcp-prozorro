@@ -703,6 +703,27 @@ function collapse(s: string): string {
  *
  * All tools return shaped, LLM-friendly objects (not raw API passthrough) and
  * never throw — fetch/parse failures resolve to { error }.
+ *
+ * INTERNAL ID vs TENDERID (fleet #2762/#2768, 2026-10-07): the search index's
+ * rows carry only the human tenderID ("UA-2025-04-23-008781-a"); the OCDS
+ * `awards`/`lots` detail that prozorro_get_tender returns needs the internal
+ * 32-hex id instead, and the search index never carries it, under any query
+ * (verified live: a row has exactly procuringEntity/status/tenderID/title/value,
+ * even when the query text IS the exact tenderID). There is no direct keyless
+ * lookup-by-tenderID either: `/tenders/UA-...` 404s, and the OpenProcurement
+ * feed silently ignores a `tenderID` filter param the same way it ignores `text`.
+ * What DOES work: the feed's list rows carry `tenderID` when you pass
+ * `opt_fields=tenderID`, so walking the feed DESCENDING (newest-modified first)
+ * and matching on tenderID resolves it — cheap, list-only calls, no per-candidate
+ * detail fetch. The feed is NOT date-seekable (an `offset` only resolves from a
+ * real cursor the API handed back, never from a constructed timestamp), so this
+ * walk is bounded and best-effort: it reaches tenders modified RECENTLY (measured
+ * 2026-10-07: ~3,000 consecutive feed records span only ~7 hours of modifications,
+ * so an old, untouched tender is not reachable this way within one request's
+ * budget). `resolveTenderIdsFromFeed` below implements this bound; both
+ * `prozorro_get_tender` (for a tenderID it's given) and `prozorro_search_tenders`
+ * (via `resolve_ids`) use it. A `null`/unresolved id means "not found in the
+ * scanned window", never "does not exist".
  */
 
 
@@ -732,7 +753,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'prozorro_search_tenders',
     description:
-      "Full-text search over ALL Ukraine ProZorro tenders back to 2015 (keyless). Searches ProZorro's own analyzed index, so Ukrainian queries stem correctly (\"школа\" also matches \"школи\", \"шкільний\") — pass Ukrainian keywords for best recall. Filter by buyer EDRPOU, by SUPPLIER/bidder EDRPOU (`tenderer` — this is the one for supplier due diligence: every tender a company has bid on or won), CPV code, status, value range, and date. Returns tenderID, title, value, buyer name + EDRPOU + region, and status, plus a total match count. Use prozorro_get_tender for the full detail of one result.",
+      "Full-text search over ALL Ukraine ProZorro tenders back to 2015 (keyless). Searches ProZorro's own analyzed index, so Ukrainian queries stem correctly (\"школа\" also matches \"школи\", \"шкільний\") — pass Ukrainian keywords for best recall. Filter by buyer EDRPOU, by SUPPLIER/bidder EDRPOU (`tenderer` — this is the one for supplier due diligence: every tender a company has bid on or won), CPV code, status, value range, and date. Returns tenderID, title, value, buyer name + EDRPOU + region, status, and an `id` field (internal 32-hex id) that is NULL unless `resolve_ids` is passed — the search index itself never carries it (verified live); prozorro_get_tender with just the tenderID now attempts the same resolution automatically, so you usually don't need `resolve_ids` here. Use prozorro_get_tender for the full detail of one result.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -746,6 +767,7 @@ const tools: McpToolExport['tools'] = [
         sort_by: { type: 'string', description: '"dateCreated" (default) or "value.amount".' },
         order: { type: 'string', description: '"desc" (default) or "asc".' },
         page: { type: ['number', 'string'], description: 'Page number, 1-500. Fixed 20 results per page.' },
+        resolve_ids: { type: 'boolean', description: 'Best-effort: try to fill in each result\'s `id` (the internal 32-hex id prozorro_get_tender needs for full detail) by scanning the most-recently-modified few thousand ProZorro records. Only finds tenders that were THEMSELVES modified recently — an old, untouched tender will still come back with id:null. Default false.' },
       },
     },
   },
@@ -765,11 +787,12 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'prozorro_get_tender',
     description:
-      "Full detail for a single Ukraine ProZorro tender by id (via the keyless OpenProcurement public API). Returns tenderID, title, description, status, procurement method, tender_value (the ORIGINAL ASKING PRICE — not money spent), the buyer/procuring entity (name, EDR identifier, region, contact), tender period (start/end), enquiry period, number of bids, line items (description, CPV classification, quantity, unit), and the OCDS award/contract stage: `award` (operative award: status, date, value, winning supplier — null if none) plus the full `awards` history, and `contract` (signed contract value/date). An `interpretation` line states plainly whether the tender_value was ever actually spent — a cancelled or unsuccessful tender still carries a populated tender_value even though zero money moved. Text is largely Ukrainian. Accepts the 32-char tender id from prozorro_recent_tenders / prozorro_search_tenders.",
+      "Full detail for a single Ukraine ProZorro tender by id (via the keyless OpenProcurement public API). Returns tenderID, title, description, status, procurementMethod + procurementMethodType (raw OCDS fields — broad method vs ProZorro's specific type, e.g. aboveThresholdUA/aboveThresholdEU), tender_value (the ORIGINAL ASKING PRICE — not money spent), the buyer/procuring entity (name, EDR identifier, region, contact), tender period (start/end), enquiry period, number of bids, line items (description, CPV classification, quantity, unit, relatedLot), `lots` (id/title/status/value, when the tender is lotted), and the OCDS award/contract stage: `award` (operative award: status, date, value, winning supplier, lotID, bid_id — null if none) plus the full `awards` history (each with the FULL `suppliers[]` array — name + identifier scheme/id — alongside the single-supplier `supplier` field kept for backward compatibility), and `contract` (signed contract value/date). An `interpretation` line states plainly whether the tender_value was ever actually spent. Pass `raw:true` to also get the complete, unshaped upstream OCDS tender object under `raw`, for any field not shaped above. Text is largely Ukrainian. Accepts the internal 32-char tender id OR a human tenderID (\"UA-2026-09-20-000012-a\") — for a tenderID this now tries to resolve the internal id by scanning the most-recently-modified feed records first (cheap, usually one call for anything modified in the last few hours) and returns FULL detail when that succeeds; it falls back to the search index's summary (detail_available:false, no awards) only when the tender wasn't modified recently enough to be found that way.",
     inputSchema: {
       type: 'object',
       properties: {
-        id: { type: 'string', description: 'Tender id — normally the internal 32-hex id (e.g. "156db6e773ba4b6e925d00f9ad3b13f4") from prozorro_recent_tenders, which is the only form that returns full detail. A human tenderID ("UA-2026-09-20-000012-a") is also accepted and returns the summary ProZorro\'s search index holds, with detail_available:false — prozorro_search_tenders returns only that form, and the index carries no 32-hex id to convert it to.' },
+        id: { type: 'string', description: 'Tender id — the internal 32-hex id (e.g. "156db6e773ba4b6e925d00f9ad3b13f4") from prozorro_recent_tenders always returns full detail. A human tenderID ("UA-2026-09-20-000012-a") from prozorro_search_tenders is also accepted; full detail depends on whether it can be resolved (see tool description) — detail_available in the response says which case you got.' },
+        raw: { type: 'boolean', description: 'Include the complete, unshaped upstream OCDS tender JSON under `raw`. Only applies when full detail is available (detail_available:true). Default false — the raw object can be large (documents, full bids, etc).' },
       },
       required: ['id'],
     },
@@ -864,6 +887,10 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
   const rows: any[] = Array.isArray(data?.data) ? data.data : [];
   const tenders = rows.map((d) => ({
     tenderID: d.tenderID ?? null,
+    // Internal 32-hex id prozorro_get_tender needs for full detail. The search
+    // index never carries this (verified live, fleet #2762/#2768) — stays null
+    // unless resolve_ids:true, and even then only for recently-modified tenders.
+    id: null as string | null,
     title: d.title ?? null,
     status: d.status ?? null,
     // ProZorro's search index does not return awards/contracts, so this
@@ -890,6 +917,23 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
   if ((dateFrom || dateTo) && !tenderer) {
     notes.push('A date filter drops tenders that have no tender period, so it can hide real matches — re-run without dates to see the full count.');
   }
+
+  const resolveIds = args.resolve_ids === true || args.resolve_ids === 'true';
+  if (resolveIds && tenders.length) {
+    const wanted = new Set(tenders.map((t) => t.tenderID).filter((x): x is string => !!x));
+    const { resolved, pagesScanned, recordsScanned, oldestScanned } = await resolveTenderIdsFromFeed(wanted);
+    for (const t of tenders) {
+      if (t.tenderID) t.id = resolved.get(t.tenderID.toUpperCase()) ?? null;
+    }
+    notes.push(
+      `resolve_ids: resolved ${resolved.size}/${wanted.size} tenderID(s) to an internal id by scanning the ` +
+      `${recordsScanned} most-recently-modified ProZorro record(s) across ${pagesScanned} feed page(s)` +
+      (oldestScanned ? `, back to ${oldestScanned}` : '') +
+      `. A null id means that tender was not modified recently enough to fall inside the scanned window — ` +
+      `it may still exist; prozorro_get_tender attempts this same resolution automatically for a single tenderID.`,
+    );
+  }
+
   return {
     query: query ?? null,
     filters: { tenderer: tenderer ?? null, buyer: buyer ?? null, cpv: cpv ?? null, status: status ?? null },
@@ -957,8 +1001,9 @@ async function searchOrganizations(args: Record<string, unknown>): Promise<unkno
  * at all — measured 2026-09-19, a search row has exactly five keys
  * (procuringEntity, status, tenderID, title, value). So the tool a caller uses
  * to FIND a tender cannot produce the key the tool that FETCHES one requires,
- * and no keyless resolution exists: the OpenProcurement feed ignores a
- * `?tenderID=` filter and returns its next 100 changes regardless.
+ * and there is no DIRECT keyless lookup: the OpenProcurement feed ignores a
+ * `?tenderID=` filter and returns its next changes regardless, same as `/tenders/UA-...`
+ * 404ing outright.
  *
  * What made it costly is what the failure LOOKED like. `/tenders/UA-...` 404s
  * with `{"name":"tender_id","description":"Not Found"}`, which reads as *this
@@ -967,14 +1012,98 @@ async function searchOrganizations(args: Record<string, unknown>): Promise<unkno
  * traffic, every call external. Looping is the correct behaviour when an error
  * blames your data instead of your key format.
  *
- * So a `UA-` id no longer 404s. We confirm the tender against the search index
- * and hand back what that index has — title, status, value, buyer — with
- * `detail_available: false` and a plain statement of why. Partial and true
- * beats an error that is false.
+ * So a `UA-` id no longer 404s. As of fleet #2762/#2768 we first try
+ * `resolveTenderIdsFromFeed` (a bounded, best-effort scan — see its own doc
+ * comment) and return FULL OCDS detail when that resolves. Only when it
+ * doesn't do we fall back to the search index's summary — title, status,
+ * value, buyer — with `detail_available: false` and a plain statement of why.
+ * Partial and true beats an error that is false.
  */
 const TENDER_ID_RE = /^UA-\d{4}-\d{2}-\d{2}-\d{6}(-[a-z])?$/i;
 
-async function getTenderByHumanId(tenderID: string): Promise<unknown> {
+/**
+ * Best-effort tenderID -> internal-32-hex-id resolver (fleet #2762/#2768).
+ *
+ * The OpenProcurement feed's list rows carry `tenderID` when you pass
+ * `opt_fields=tenderID` (verified live 2026-10-07) — so walking the feed
+ * DESCENDING (most-recently-modified first) and matching on tenderID resolves
+ * it, cheaply: each call is a list-only page (~200 id/tenderID pairs), no
+ * per-candidate detail fetch.
+ *
+ * This is NOT a general index lookup. The feed is not date-seekable (an
+ * `offset` only resolves from a real cursor the API itself handed back, never
+ * from a constructed timestamp — a synthetic offset silently returns an empty
+ * page rather than seeking or erroring), so there is no way to jump near a
+ * tender's creation date. Walking from "now" backward only reaches tenders
+ * that were THEMSELVES modified recently. Measured 2026-10-07: 3,000
+ * consecutive feed records span roughly 7 hours of modifications, so an old,
+ * untouched tender is not reachable this way inside one request's time
+ * budget — this is bounded (maxPages/budgetMs below) to stay inside it. An
+ * id that comes back unresolved means "not found in the scanned window", not
+ * "does not exist".
+ */
+async function resolveTenderIdsFromFeed(
+  wanted: Set<string>,
+  opts: { maxPages?: number; budgetMs?: number } = {},
+): Promise<{ resolved: Map<string, string>; pagesScanned: number; recordsScanned: number; oldestScanned?: string }> {
+  const maxPages = opts.maxPages ?? 15; // ~3,000 records
+  const budgetMs = opts.budgetMs ?? 9000;
+  const resolved = new Map<string, string>();
+  const remaining = new Set(Array.from(wanted, (w) => w.toUpperCase()));
+  let url = `${BASE}/tenders?descending=1&limit=200&opt_fields=tenderID`;
+  let pagesScanned = 0;
+  let recordsScanned = 0;
+  let oldestScanned: string | undefined;
+  const start = Date.now();
+  while (remaining.size > 0 && pagesScanned < maxPages && Date.now() - start < budgetMs) {
+    let page: any;
+    try {
+      const res = await pwFetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA } });
+      if (!res.ok) break;
+      page = await res.json();
+    } catch {
+      break;
+    }
+    pagesScanned++;
+    const rows: any[] = Array.isArray(page?.data) ? page.data : [];
+    if (!rows.length) break;
+    oldestScanned = rows[rows.length - 1]?.dateModified ?? oldestScanned;
+    for (const r of rows) {
+      recordsScanned++;
+      const tid = String(r?.tenderID ?? '').toUpperCase();
+      if (tid && remaining.has(tid) && r?.id) {
+        resolved.set(tid, r.id);
+        remaining.delete(tid);
+      }
+    }
+    const next = page?.next_page?.uri;
+    if (!next || remaining.size === 0) break;
+    url = next;
+  }
+  return { resolved, pagesScanned, recordsScanned, oldestScanned };
+}
+
+async function getTenderByHumanId(tenderID: string, raw: boolean): Promise<unknown> {
+  // Try the bounded feed resolve FIRST — when it hits, we skip the search
+  // index entirely and return full OCDS detail instead of a summary stub.
+  let resolveStats: { pagesScanned: number; recordsScanned: number; oldestScanned?: string } | null = null;
+  try {
+    const { resolved, ...stats } = await resolveTenderIdsFromFeed(new Set([tenderID]));
+    resolveStats = stats;
+    const hexId = resolved.get(tenderID.toUpperCase());
+    if (hexId) {
+      const data = (await opGet(`/tenders/${encodeURIComponent(hexId)}`)) as { data?: any };
+      if (data.data) {
+        return {
+          ...shapeTenderDetail(data.data, raw),
+          resolved_via: `recent-feed-scan (${stats.recordsScanned} record(s), ${stats.pagesScanned} page(s))`,
+        };
+      }
+    }
+  } catch {
+    // Fall through to the search-index summary path below.
+  }
+
   const p = new URLSearchParams();
   p.set('text', tenderID);
   let rows: any[] = [];
@@ -1022,17 +1151,31 @@ async function getTenderByHumanId(tenderID: string): Promise<unknown> {
     note:
       'This tender EXISTS and the fields above are real, but they are everything ProZorro\'s search index ' +
       'carries. Full detail (description, line items, bids, awards, contract) needs the internal 32-character ' +
-      'tender id, which the search index does not return, so it cannot be fetched from a UA-… tenderID alone. ' +
+      'tender id. I tried to resolve it automatically by scanning the ' +
+      `${resolveStats?.recordsScanned ?? 0} most-recently-modified ProZorro record(s)` +
+      (resolveStats?.oldestScanned ? ` (back to ${resolveStats.oldestScanned})` : '') +
+      ' and it was not in that window — either it has not been modified recently, or it does not exist. ' +
       'prozorro_recent_tenders returns both ids together for currently-active tenders.',
   };
 }
 
 async function getTender(args: Record<string, unknown>): Promise<unknown> {
   const id = reqIdArg(args, 'id', '156db6e773ba4b6e925d00f9ad3b13f4');
-  if (TENDER_ID_RE.test(id.trim())) return getTenderByHumanId(id.trim());
+  const raw = args.raw === true || args.raw === 'true';
+  if (TENDER_ID_RE.test(id.trim())) return getTenderByHumanId(id.trim(), raw);
   const data = (await opGet(`/tenders/${encodeURIComponent(id)}`)) as { data?: any };
   const d = data.data;
   if (!d) return { error: 'tender not found', id };
+  return shapeTenderDetail(d, raw);
+}
+
+/**
+ * Shape a raw OpenProcurement/OCDS tender object into the LLM-friendly form
+ * both getTender() (direct hex id) and getTenderByHumanId() (resolved
+ * tenderID) return — kept as one function so the two entry paths can never
+ * drift into different shapes.
+ */
+function shapeTenderDetail(d: any, includeRaw: boolean): Record<string, unknown> {
   const pe = d.procuringEntity ?? {};
   // OpenProcurement's tender object already carries `awards` and `contracts` at
   // the top level once the process moves past tendering — this pack simply
@@ -1049,7 +1192,19 @@ async function getTender(args: Record<string, unknown>): Promise<unknown> {
     description: d.description,
     status: d.status,
     interpretation: statusInterpretation(d.status),
+    // Historical name: this has ALWAYS held procurementMethodType's value
+    // (e.g. "aboveThresholdUA"), not the broad OCDS `procurementMethod`
+    // ("open"/"limited"/…) the name suggests. Left unchanged for backward
+    // compat (fleet #2762/#2768) — use the two fields below for the
+    // correctly-named raw OCDS values.
     procurementMethod: d.procurementMethodType,
+    // The OCDS field by its real name and value (aboveThresholdUA,
+    // aboveThresholdEU, reporting, negotiation, …) — previously only
+    // reachable under the misleading `procurementMethod` key above.
+    procurementMethodType: d.procurementMethodType,
+    // The OTHER raw OCDS field (open | selective | limited | …) — previously
+    // dropped entirely, under any name.
+    procurementMethodBroad: d.procurementMethod,
     // The ORIGINAL ASKING PRICE at tender stage — not what was spent. See
     // `award`/`contract` below for the amount actually committed, and
     // `interpretation` for whether this tender resulted in any spend at all.
@@ -1066,12 +1221,20 @@ async function getTender(args: Record<string, unknown>): Promise<unknown> {
     enquiryPeriod: shapePeriod(d.enquiryPeriod),
     numberOfBids: d.numberOfBids ?? (Array.isArray(d.bids) ? d.bids.length : undefined),
     dateModified: d.dateModified,
+    // Lots — present only on lotted tenders. Each item below carries
+    // `relatedLot` (a lot id) linking it back to one of these, and each award
+    // carries `lotID` doing the same for the award side.
+    lots: Array.isArray(d.lots) ? d.lots.map(shapeLot) : [],
     items: (d.items ?? []).map((it: any) => ({
       description: it.description,
       cpv: it.classification?.id,
       cpvDescription: it.classification?.description,
       quantity: it.quantity,
       unit: it.unit?.name ?? it.unit?.code,
+      // Links this item to one of `lots` above, on a lotted tender. Absent
+      // (not null) on a single-lot tender, so that shape doesn't grow a
+      // meaningless key. Fixed fleet #2762/#2768.
+      relatedLot: it.relatedLot ?? undefined,
     })),
     // The operative award: the ACTIVE one if any, else the most recent
     // (an award can be cancelled/unsuccessful and superseded by a later one).
@@ -1082,6 +1245,17 @@ async function getTender(args: Record<string, unknown>): Promise<unknown> {
     // a caller needs to see how the process actually played out.
     awards: Array.isArray(d.awards) ? d.awards.map(shapeAward) : [],
     contract: contract ? shapeContract(contract) : null,
+    detail_available: true,
+    ...(includeRaw ? { raw: d } : {}),
+  };
+}
+
+function shapeLot(l: any): Record<string, unknown> {
+  return {
+    id: l?.id ?? null,
+    title: l?.title ?? null,
+    status: l?.status ?? null,
+    value: shapeValue(l?.value) ?? null,
   };
 }
 
@@ -1187,15 +1361,35 @@ function pickOperativeContract(contracts: any[] | undefined): any | null {
 }
 
 function shapeAward(a: any): Record<string, unknown> {
-  const supplier = Array.isArray(a?.suppliers) ? a.suppliers[0] : undefined;
+  const suppliersArr: any[] = Array.isArray(a?.suppliers) ? a.suppliers : [];
+  const supplier = suppliersArr[0];
   return {
     id: a?.id ?? null,
     status: a?.status ?? null, // pending | active | cancelled | unsuccessful
     date: a?.date ?? null,
     value: shapeValue(a?.value) ?? null,
+    // First supplier only — kept for backward compat. OCDS/ProZorro awards can
+    // carry a CONSORTIUM of multiple suppliers; this field alone silently
+    // truncated that to one. Use `suppliers` below for the complete list.
+    // Fixed fleet #2762/#2768.
     supplier: supplier
       ? { name: supplier.name ?? supplier.identifier?.legalName ?? null, edrpou: supplier.identifier?.id ?? null }
       : null,
+    // The FULL supplier list (1 entry for a normal award, 2+ for a
+    // consortium/joint bid). Each entry carries the OCDS identifier SCHEME
+    // (usually "UA-EDR") alongside the id, since a caller matching by EDRPOU
+    // needs to know which code space it's in.
+    suppliers: suppliersArr.map((s: any) => ({
+      name: s?.name ?? s?.identifier?.legalName ?? null,
+      identifier_scheme: s?.identifier?.scheme ?? null,
+      edrpou: s?.identifier?.id ?? null,
+    })),
+    // Links this award to one of the tender's `lots` (lotID) and to the
+    // winning `bids[].id` (bid_id) — only present on a lotted tender's
+    // awards. Absent (not null) when the tender has no lots, so a
+    // single-lot tender's output doesn't grow meaningless keys.
+    lotID: a?.lotID ?? undefined,
+    bid_id: a?.bid_id ?? undefined,
     // Why there is no active award, when applicable (e.g. "unsuccessful" /
     // a cancellation reason) — present on non-active awards, absent on active.
     reason: a?.status !== 'active' ? (a?.statusDetails ?? a?.title ?? null) : undefined,
