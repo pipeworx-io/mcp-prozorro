@@ -25,6 +25,93 @@ interface McpToolExport {
 }
 
 /**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -724,6 +811,32 @@ function collapse(s: string): string {
  * `prozorro_get_tender` (for a tenderID it's given) and `prozorro_search_tenders`
  * (via `resolve_ids`) use it. A `null`/unresolved id means "not found in the
  * scanned window", never "does not exist".
+ *
+ * THROTTLING (fleet #2836, 2026-10-08): 305 of ~931 calls in the 24h after
+ * 8ef0ca91a landed were `upstream_throttled` — 263 on prozorro_search_tenders,
+ * 42 on prozorro_search_organizations, a third of all prozorro traffic getting
+ * no answer. Measured live against prozorro.gov.ua/api/search (curl, this
+ * machine's egress, 2026-10-08T17:30Z): `x-ratelimit-limit: 60`,
+ * `x-ratelimit-remaining` decrementing by exactly 1 per call, SHARED across
+ * `/api/search/tenders` AND `/api/search/organizations` (one bucket, not two —
+ * draining one drains the other), resetting on what measured as a ~60s
+ * window. The 429 itself carries `retry-after` (observed 1-3s at the tail of a
+ * window) and `x-ratelimit-reset` (unix epoch). Because search_organizations
+ * throttles too and never touches the change-feed at all, the feed-scan this
+ * header used to name as "the prime suspect" is NOT the cause of this specific
+ * throttle — it is a tight, apparently-shared-IP-wide 60 req/min budget on the
+ * search subdomain, hit by ordinary demand. Two fixes, both below: (1) a KV
+ * cache-aside around every `searchPost` call (`cachedSearchPost`), keyed on
+ * the exact query, amortizing repeated/duplicate queries across every caller
+ * and Cloudflare colo rather than re-spending budget on each one; (2) a
+ * single bounded wait-and-retry honouring the upstream `Retry-After` header
+ * (capped at RETRY_AFTER_MAX_WAIT_SEC) before giving up loud with a
+ * `retry_after` field in the response envelope. The change-feed fetches
+ * (`resolveTenderIdsFromFeed`) get the same KV cache-aside treatment on
+ * general principle — they hit a different host with no observed rate-limit
+ * headers, but amortizing them across concurrent callers is still Frugality
+ * for free, and `prozorro_get_tender` now calls that path automatically for
+ * every human tenderID.
  */
 
 
@@ -737,6 +850,55 @@ async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response>
 
 const BASE = 'https://public.api.openprocurement.org/api/2.5';
 const UA = 'pipeworx/1.0 (+https://pipeworx.io)';
+
+// --- KV cache-aside (fleet #2836) -------------------------------------------
+//
+// The gateway injects its one shared KV namespace as `_cacheKv` when
+// `injectCacheKv: true` is set on this pack's pack-manifest.json row (same
+// mechanism as spain-tenders/wisconsin-code). A missing/absent binding
+// (standalone build, or a KV read/write failure) degrades cleanly to the old
+// uncached live fetch — caching is an optimization and must never be why a
+// call fails.
+interface KvLike {
+  get(key: string, type: 'json'): Promise<unknown>;
+  put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+}
+
+function kvFromArgs(args: Record<string, unknown>): KvLike | undefined {
+  const kv = args._cacheKv;
+  return kv && typeof (kv as KvLike).get === 'function' && typeof (kv as KvLike).put === 'function'
+    ? (kv as KvLike)
+    : undefined;
+}
+
+type CacheMeta = { stale: boolean; cacheAgeSec: number; servedFrom: 'fresh-cache' | 'stale-cache' | 'upstream' };
+
+function cacheFields(meta: CacheMeta): Record<string, unknown> {
+  return { served_from: meta.servedFrom, stale: meta.stale, cache_age_sec: meta.cacheAgeSec };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRetryAfter(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const n = Number(header.trim());
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+// How long a single bounded wait-and-retry is allowed to hold a call for.
+// Measured live 2026-10-08: ProZorro's search 429 carries `retry-after` of
+// 1-3s at the tail of its 60-req/60s window — waiting that long once turns a
+// throttle most callers would otherwise see into a normal answer, without
+// risking the Worker's own execution budget. A larger Retry-After (the
+// upstream asking for longer) is NOT worth blocking the call for — surface it
+// immediately instead.
+const RETRY_AFTER_MAX_WAIT_SEC = 3;
+// What a caller is told to wait when the upstream 429 carries no Retry-After
+// header at all — the measured window length, so "retry in 60s" is a real
+// number, not a guess.
+const DEFAULT_RETRY_AFTER_SEC = 60;
 
 const tools: McpToolExport['tools'] = [
   {
@@ -814,8 +976,54 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         return { error: `Unknown tool: ${name}` };
     }
   } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e) };
+    return classifiedError(e);
   }
+}
+
+/**
+ * Split a leading `code: ` routing token (the classifyToolError convention —
+ * `not_found:` / `upstream_throttled:` / `upstream_down:` / `user_error:` /
+ * `auth_required:`, shared/src/error-prefix.ts) off a thrown error's message
+ * into a `{error: code, message: prose}` envelope.
+ *
+ * Before this (fleet #2828), every thrown error in this pack landed in ONE
+ * field — `{ error: e.message }` — which did two things wrong at once: (a) a
+ * token-prefixed throw (searchPost's own `upstream_throttled:`/
+ * `upstream_down:`) leaked the raw routing token straight into the caller's
+ * error text instead of being stripped the way the gateway strips it on a
+ * THROWN exception it catches itself — this pack's own top-level catch never
+ * lets that exception reach the gateway, so nothing ever stripped it; and (b)
+ * a throw with NO token at all (every opGet() non-2xx before this fix) landed
+ * as unclassifiable prose, which `classifyToolError` books as `error` — the
+ * tier that means "Pipeworx has a defect". Measured live 2026-10-08: 57 of
+ * 951 calls (6.0%) on prozorro_get_tender booked this way, and reproducing it
+ * showed the dominant shape was a stale/nonexistent tender id 404ing with no
+ * token — a caller mistake, not a bug here — getting the single worst
+ * possible retry_hint for it ("retry with arguments matching the examples",
+ * i.e. retry the exact same bad id).
+ */
+const CLASS_TOKEN_RE = /^(not_found|upstream_throttled|upstream_down|user_error|auth_required):\s*/;
+function classifiedError(e: unknown): { error: string; message?: string; retry_after?: number } {
+  const raw = e instanceof Error ? e.message : String(e);
+  const m = CLASS_TOKEN_RE.exec(raw);
+  // Carried by throwUpstreamThrottled below — surfaced here too so a throw
+  // that falls through to callTool's generic catch (rather than being caught
+  // locally) still reaches the caller with a real `retry_after` (fleet #2836).
+  const retryAfter = e instanceof Error && typeof (e as Error & { retryAfterSec?: unknown }).retryAfterSec === 'number'
+    ? (e as Error & { retryAfterSec: number }).retryAfterSec
+    : undefined;
+  const base = m ? { error: m[1], message: raw.slice(m[0].length) } : { error: raw };
+  return retryAfter !== undefined ? { ...base, retry_after: retryAfter } : base;
+}
+
+// Throw ProZorro's own 429 as a classified, retry_after-carrying error — the
+// one place both searchPost and opGet construct an upstream_throttled throw,
+// so the field always travels with it regardless of which catch handles it
+// (fleet #2836; see classifiedError above for how it surfaces to the caller).
+function throwUpstreamThrottled(message: string, retryAfterSec: number | undefined): never {
+  const err = new Error(`upstream_throttled: ${message}`);
+  (err as Error & { retryAfterSec: number }).retryAfterSec = retryAfterSec ?? DEFAULT_RETRY_AFTER_SEC;
+  throw err;
 }
 
 // --- tools -----------------------------------------------------------------
@@ -833,19 +1041,90 @@ const SEARCH_BASE = 'https://prozorro.gov.ua/api/search';
  * ProZorro's real search index. POST, not GET — sending GET returns 405, which
  * a previous version of this pack read as "blocked from datacenter egress" and
  * built a 100-record client-side filter around.
+ *
+ * Fleet #2836: this endpoint enforces `x-ratelimit-limit: 60` per ~60s window,
+ * SHARED between /api/search/tenders and /api/search/organizations (verified
+ * live 2026-10-08 — draining one drains the other's `x-ratelimit-remaining`
+ * too). A 429 here carries `retry-after` (observed 1-3s at the tail of a
+ * window). `retried` is set only by this function's own one-shot retry below
+ * — never pass it in from a caller.
  */
-async function searchPost(path: string, params: URLSearchParams): Promise<any> {
+async function searchPost(path: string, params: URLSearchParams, retried = false): Promise<any> {
   const res = await pwFetch(`${SEARCH_BASE}${path}?${params.toString()}`, {
     method: 'POST',
     headers: { Accept: 'application/json', 'User-Agent': UA },
   });
   if (!res.ok) {
     const body = await res.text().then((t) => t.slice(0, 200)).catch(() => '');
-    if (res.status === 429) throw new Error(`upstream_throttled: ProZorro search rate limit (HTTP 429). ${body}`.trim());
+    if (res.status === 429) {
+      const retryAfterSec = parseRetryAfter(res.headers.get('retry-after'));
+      // Bounded single retry: wait exactly what the upstream asked for (never
+      // more than RETRY_AFTER_MAX_WAIT_SEC), then try once more. Most callers
+      // sit at the tail of the 60s window when they get throttled, so a
+      // short wait is usually enough to turn this into a normal answer.
+      if (!retried && retryAfterSec !== undefined && retryAfterSec > 0 && retryAfterSec <= RETRY_AFTER_MAX_WAIT_SEC) {
+        await sleep(retryAfterSec * 1000);
+        return searchPost(path, params, true);
+      }
+      throwUpstreamThrottled(
+        `ProZorro search rate limit (HTTP 429, 60 requests/min shared across search endpoints). ${body}`.trim(),
+        retryAfterSec,
+      );
+    }
     if (res.status >= 500) throw new Error(`upstream_down: ProZorro search ${res.status}. ${body}`.trim());
     throw new Error(`ProZorro search: ${res.status} ${body}`.trim());
   }
   return res.json();
+}
+
+// Query results change slowly enough (minutes, not seconds) that caching them
+// is a real win against the shared 60-req/min budget above, and it costs
+// nothing a caller needs second-fresh data for. Keyed on the exact query
+// (path + every param, sorted) so distinct queries never collide and
+// identical ones — the common case for a popular EDRPOU or buyer name, or a
+// caller retrying — share one upstream call across every caller and colo.
+const SEARCH_CACHE_FRESH_SEC = 180; // 3 min
+const SEARCH_CACHE_RETENTION_SEC = 30 * 60; // stale-fallback window if a refetch throttles
+
+function searchCacheKey(path: string, params: URLSearchParams): string {
+  const sorted = new URLSearchParams(params);
+  sorted.sort();
+  return `prozorro:search${path}:${sorted.toString()}`;
+}
+
+async function cachedSearchPost(path: string, params: URLSearchParams, kv: KvLike | undefined): Promise<{ data: any; cache: CacheMeta }> {
+  const key = searchCacheKey(path, params);
+  let cached: { cachedAt: number; data: any } | null = null;
+  if (kv) {
+    try {
+      cached = (await kv.get(key, 'json')) as { cachedAt: number; data: any } | null;
+    } catch {
+      cached = null; // caching is an optimization; a KV read failure must not fail the call
+    }
+  }
+  const ageSec = cached ? Math.max(0, Math.round((Date.now() - cached.cachedAt) / 1000)) : null;
+  if (cached && ageSec !== null && ageSec < SEARCH_CACHE_FRESH_SEC) {
+    return { data: cached.data, cache: { stale: false, cacheAgeSec: ageSec, servedFrom: 'fresh-cache' } };
+  }
+  try {
+    const data = await searchPost(path, params);
+    if (kv) {
+      kv.put(key, JSON.stringify({ cachedAt: Date.now(), data }), { expirationTtl: SEARCH_CACHE_RETENTION_SEC }).catch(() => {
+        /* best-effort; a write failure must not fail an otherwise-successful live call */
+      });
+    }
+    return { data, cache: { stale: false, cacheAgeSec: 0, servedFrom: 'upstream' } };
+  } catch (e) {
+    // The live call failed (429 after the bounded retry already used up its
+    // one shot, or a genuine outage). Serve the still-usable KV entry rather
+    // than throttling every caller who shares this exact query — but only
+    // when we actually have one; a true miss stays the loud error it always
+    // was (fleet #2836 adds `retry_after` to that error; see classifiedError).
+    if (cached && ageSec !== null) {
+      return { data: cached.data, cache: { stale: true, cacheAgeSec: ageSec, servedFrom: 'stale-cache' } };
+    }
+    throw e;
+  }
 }
 
 async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
@@ -883,7 +1162,8 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
   p.set('order', strArg(args.order) ?? 'desc');
   p.set('page', String(clampNum(numArg(args.page), 1, 1, 500)));
 
-  const data = await searchPost('/tenders', p);
+  const kv = kvFromArgs(args);
+  const { data, cache } = await cachedSearchPost('/tenders', p, kv);
   const rows: any[] = Array.isArray(data?.data) ? data.data : [];
   const tenders = rows.map((d) => ({
     tenderID: d.tenderID ?? null,
@@ -921,7 +1201,7 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
   const resolveIds = args.resolve_ids === true || args.resolve_ids === 'true';
   if (resolveIds && tenders.length) {
     const wanted = new Set(tenders.map((t) => t.tenderID).filter((x): x is string => !!x));
-    const { resolved, pagesScanned, recordsScanned, oldestScanned } = await resolveTenderIdsFromFeed(wanted);
+    const { resolved, pagesScanned, recordsScanned, oldestScanned } = await resolveTenderIdsFromFeed(wanted, { kv });
     for (const t of tenders) {
       if (t.tenderID) t.id = resolved.get(t.tenderID.toUpperCase()) ?? null;
     }
@@ -942,6 +1222,7 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
     per_page: Number(data?.per_page ?? 20),
     returned: tenders.length,
     source: 'ProZorro full-text search (prozorro.gov.ua), full history from 2015',
+    ...cacheFields(cache),
     ...(notes.length ? { notes } : {}),
     tenders,
   };
@@ -957,12 +1238,13 @@ async function searchOrganizations(args: Record<string, unknown>): Promise<unkno
   if (!name) throw new Error('prozorro_search_organizations requires "name" — a company or buyer name (Ukrainian recommended).');
   const role = strArg(args.role) === 'buyer' ? 'buyer' : 'tenderer';
   const p = new URLSearchParams({ type: role, value: name });
-  const data = await searchPost('/organizations', p);
+  const { data, cache } = await cachedSearchPost('/organizations', p, kvFromArgs(args));
   const rows: any[] = Array.isArray(data?.data) ? data.data : [];
   return {
     name,
     role,
     count: rows.length,
+    ...cacheFields(cache),
     note:
       `Pass an "edrpou" below as the ${role === 'buyer' ? 'buyer' : 'tenderer'} argument of ` +
       `prozorro_search_tenders. Two cautions: these are several DISTINCT legal entities, not one ` +
@@ -1042,9 +1324,51 @@ const TENDER_ID_RE = /^UA-\d{4}-\d{2}-\d{2}-\d{6}(-[a-z])?$/i;
  * id that comes back unresolved means "not found in the scanned window", not
  * "does not exist".
  */
+// A feed page (keyed by its exact URL, including the cursor) is identical for
+// every caller who hits it inside the freshness window, so multiple callers'
+// resolve attempts inside that window share one upstream fetch instead of
+// each paying for their own 15-page walk (fleet #2836). The feed changes
+// continuously, so the window is short — long enough to amortize a burst of
+// concurrent callers, short enough that a stale page still reflects "recent"
+// modifications for this best-effort lookup.
+const FEED_PAGE_CACHE_FRESH_SEC = 30;
+const FEED_PAGE_CACHE_RETENTION_SEC = 5 * 60;
+
+function feedPageCacheKey(url: string): string {
+  return `prozorro:feed_page:${url}`;
+}
+
+async function fetchFeedPageCached(url: string, kv: KvLike | undefined): Promise<any | null> {
+  const key = feedPageCacheKey(url);
+  if (kv) {
+    try {
+      const cached = (await kv.get(key, 'json')) as { cachedAt: number; page: any } | null;
+      if (cached && Date.now() - cached.cachedAt < FEED_PAGE_CACHE_FRESH_SEC * 1000) {
+        return cached.page;
+      }
+    } catch {
+      /* caching is an optimization; a KV read failure must not fail the call */
+    }
+  }
+  let page: any;
+  try {
+    const res = await pwFetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA } });
+    if (!res.ok) return null;
+    page = await res.json();
+  } catch {
+    return null;
+  }
+  if (kv) {
+    kv.put(key, JSON.stringify({ cachedAt: Date.now(), page }), { expirationTtl: FEED_PAGE_CACHE_RETENTION_SEC }).catch(() => {
+      /* best-effort */
+    });
+  }
+  return page;
+}
+
 async function resolveTenderIdsFromFeed(
   wanted: Set<string>,
-  opts: { maxPages?: number; budgetMs?: number } = {},
+  opts: { maxPages?: number; budgetMs?: number; kv?: KvLike } = {},
 ): Promise<{ resolved: Map<string, string>; pagesScanned: number; recordsScanned: number; oldestScanned?: string }> {
   const maxPages = opts.maxPages ?? 15; // ~3,000 records
   const budgetMs = opts.budgetMs ?? 9000;
@@ -1056,14 +1380,8 @@ async function resolveTenderIdsFromFeed(
   let oldestScanned: string | undefined;
   const start = Date.now();
   while (remaining.size > 0 && pagesScanned < maxPages && Date.now() - start < budgetMs) {
-    let page: any;
-    try {
-      const res = await pwFetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA } });
-      if (!res.ok) break;
-      page = await res.json();
-    } catch {
-      break;
-    }
+    const page = await fetchFeedPageCached(url, opts.kv);
+    if (!page) break;
     pagesScanned++;
     const rows: any[] = Array.isArray(page?.data) ? page.data : [];
     if (!rows.length) break;
@@ -1083,12 +1401,12 @@ async function resolveTenderIdsFromFeed(
   return { resolved, pagesScanned, recordsScanned, oldestScanned };
 }
 
-async function getTenderByHumanId(tenderID: string, raw: boolean): Promise<unknown> {
+async function getTenderByHumanId(tenderID: string, raw: boolean, kv: KvLike | undefined): Promise<unknown> {
   // Try the bounded feed resolve FIRST — when it hits, we skip the search
   // index entirely and return full OCDS detail instead of a summary stub.
   let resolveStats: { pagesScanned: number; recordsScanned: number; oldestScanned?: string } | null = null;
   try {
-    const { resolved, ...stats } = await resolveTenderIdsFromFeed(new Set([tenderID]));
+    const { resolved, ...stats } = await resolveTenderIdsFromFeed(new Set([tenderID]), { kv });
     resolveStats = stats;
     const hexId = resolved.get(tenderID.toUpperCase());
     if (hexId) {
@@ -1107,18 +1425,41 @@ async function getTenderByHumanId(tenderID: string, raw: boolean): Promise<unkno
   const p = new URLSearchParams();
   p.set('text', tenderID);
   let rows: any[] = [];
+  let cache: CacheMeta | undefined;
   try {
-    const found = await searchPost('/tenders', p);
-    rows = Array.isArray(found?.data) ? found.data : [];
-  } catch {
+    const found = await cachedSearchPost('/tenders', p, kv);
+    rows = Array.isArray(found.data?.data) ? found.data.data : [];
+    cache = found.cache;
+  } catch (err) {
     // Search is a second upstream and can be down on its own. Say that, rather
-    // than letting its outage read as "no such tender".
+    // than letting its outage read as "no such tender" — AND keep the real
+    // classification searchPost already attached (upstream_throttled:/
+    // upstream_down:), rather than swallowing it into untokened prose. Before
+    // this (fleet #2828), every one of these booked as `error` — the tier
+    // that means "Pipeworx has a defect" — for what is in fact the SEARCH
+    // index being down or rate-limited, indistinguishable at the metrics
+    // layer from a genuine bug here.
+    const raw = err instanceof Error ? err.message : String(err);
+    const { token, body: fragment } = splitClassPrefix(raw);
+    // The outer envelope's `error` field already declares the class (below),
+    // so the fragment embedded mid-sentence here is explicitly de-tokened via
+    // dropClassPrefix rather than hoisted — it never reaches position 0, and
+    // leaving a stray token in it would only leak, per shared/src/error-prefix.ts.
+    const prose = dropClassPrefix(fragment);
+    // Fleet #2836: carry the upstream's own Retry-After through to the
+    // caller when this is the throttled case, rather than a bare "try again
+    // shortly" with no number behind it.
+    const retryAfter = err instanceof Error && typeof (err as Error & { retryAfterSec?: unknown }).retryAfterSec === 'number'
+      ? (err as Error & { retryAfterSec: number }).retryAfterSec
+      : undefined;
     return {
-      error:
+      error: token ? token.replace(/:\s*$/, '').trim() : 'upstream_down',
+      message:
         `"${tenderID}" is a ProZorro tenderID, and this tool needs the internal 32-character id instead. ` +
-        'I could not reach the search index to look it up just now, so I cannot tell you whether the tender exists. Try again shortly.',
+        `I could not reach the search index to look it up just now (${prose || 'unknown error'}), so I cannot tell you whether the tender exists. Try again shortly.`,
       tenderID,
       detail_available: false,
+      ...(retryAfter !== undefined ? { retry_after: retryAfter } : {}),
     };
   }
 
@@ -1148,6 +1489,7 @@ async function getTenderByHumanId(tenderID: string, raw: boolean): Promise<unkno
     buyer_edrpou: pe.identifier?.id ?? null,
     region: pe.address?.region ?? null,
     detail_available: false,
+    ...(cache ? cacheFields(cache) : {}),
     note:
       'This tender EXISTS and the fields above are real, but they are everything ProZorro\'s search index ' +
       'carries. Full detail (description, line items, bids, awards, contract) needs the internal 32-character ' +
@@ -1162,10 +1504,32 @@ async function getTenderByHumanId(tenderID: string, raw: boolean): Promise<unkno
 async function getTender(args: Record<string, unknown>): Promise<unknown> {
   const id = reqIdArg(args, 'id', '156db6e773ba4b6e925d00f9ad3b13f4');
   const raw = args.raw === true || args.raw === 'true';
-  if (TENDER_ID_RE.test(id.trim())) return getTenderByHumanId(id.trim(), raw);
-  const data = (await opGet(`/tenders/${encodeURIComponent(id)}`)) as { data?: any };
+  if (TENDER_ID_RE.test(id.trim())) return getTenderByHumanId(id.trim(), raw, kvFromArgs(args));
+  let data: { data?: any };
+  try {
+    data = (await opGet(`/tenders/${encodeURIComponent(id)}`)) as { data?: any };
+  } catch (err) {
+    // Caught locally (rather than left to callTool's generic catch) so the
+    // envelope can still carry `id` — the field every caller of this tool
+    // keys on, and the one classifiedError() alone has no way to know about.
+    return { ...classifiedError(err), id };
+  }
   const d = data.data;
-  if (!d) return { error: 'tender not found', id };
+  // opGet() already throws (and this never runs) when OpenProcurement itself
+  // answers non-2xx; this is the rarer case where it answers 200 with no
+  // `data` body. Classified and id-echoed the same way opGet's 404 is (fleet
+  // #2828) — the bare `{error: 'tender not found', id}` this used to return
+  // carried no routing token and never echoed the id INSIDE the message, so
+  // classifyToolError's `not_found`-shape regexes had nothing to anchor on
+  // and it booked as `error`, the Pipeworx-defect tier, for a caller's
+  // stale/nonexistent id.
+  if (!d) {
+    return {
+      error: 'not_found',
+      message: `ProZorro tender "${id}" not found — the OpenProcurement API returned no tender data for this id. Check the id; prozorro_recent_tenders and prozorro_search_tenders both return a valid internal id for an existing tender.`,
+      id,
+    };
+  }
   return shapeTenderDetail(d, raw);
 }
 
@@ -1410,8 +1774,36 @@ async function opGet(path: string): Promise<unknown> {
     headers: { Accept: 'application/json', 'User-Agent': UA },
   });
   if (!res.ok) {
-    const body = await res.text().then((t) => t.slice(0, 200)).catch(() => '');
-    throw new Error(`ProZorro/OpenProcurement API: ${res.status} ${body}`.trim());
+    const body = await res.text().catch(() => '');
+    // Mined, not pasted: OpenProcurement's 404 body is a JSON fault object
+    // ({"status":"error","errors":[{"description":"Not Found"}]}), and handing
+    // that markup to an agent instead of a sentence is the exact defect
+    // check:error-body-leak exists to catch. summarizeErrorBody extracts the
+    // one readable phrase and strips the rest.
+    const detail = summarizeErrorBody(body);
+    const suffix = detail ? ` — ${detail}` : '';
+    // Classified the same way searchPost() above already classifies ITS OWN
+    // 429/5xx (fleet #2828) — before this, every non-2xx from this feed/detail
+    // endpoint threw an unprefixed message, which classifyToolError has no
+    // generic rule for on 404 (deliberately: a bare 404 is usually "this one
+    // record doesn't exist," not "the service is down"), so it booked as
+    // `error` — the tier that means "Pipeworx has a defect" — for what is
+    // almost always a caller's stale/nonexistent tender id. 429/5xx already
+    // fell into the right class via classifyToolError's generic status-code
+    // regexes even unprefixed, but are tagged explicitly here too so the
+    // envelope this throws always carries a clean `error` code rather than a
+    // raw status line.
+    if (res.status === 404) {
+      throw new Error(`not_found: ProZorro/OpenProcurement tender not found at ${path} (HTTP 404)${suffix}`);
+    }
+    if (res.status === 429) {
+      throwUpstreamThrottled(
+        `ProZorro/OpenProcurement API rate limit (HTTP 429)${suffix}`,
+        parseRetryAfter(res.headers.get('retry-after')),
+      );
+    }
+    if (res.status >= 500) throw new Error(`upstream_down: ProZorro/OpenProcurement API ${res.status}${suffix}`);
+    throw new Error(`ProZorro/OpenProcurement API: ${res.status}${suffix}`);
   }
   return res.json();
 }
