@@ -949,12 +949,25 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'prozorro_get_tender',
     description:
-      "Full detail for a single Ukraine ProZorro tender by id (via the keyless OpenProcurement public API). Returns tenderID, title, description, status, procurementMethod + procurementMethodType (raw OCDS fields — broad method vs ProZorro's specific type, e.g. aboveThresholdUA/aboveThresholdEU), tender_value (the ORIGINAL ASKING PRICE — not money spent), the buyer/procuring entity (name, EDR identifier, region, contact), tender period (start/end), enquiry period, number of bids, line items (description, CPV classification, quantity, unit, relatedLot), `lots` (id/title/status/value, when the tender is lotted), and the OCDS award/contract stage: `award` (operative award: status, date, value, winning supplier, lotID, bid_id — null if none) plus the full `awards` history (each with the FULL `suppliers[]` array — name + identifier scheme/id — alongside the single-supplier `supplier` field kept for backward compatibility), and `contract` (signed contract value/date). An `interpretation` line states plainly whether the tender_value was ever actually spent. Pass `raw:true` to also get the complete, unshaped upstream OCDS tender object under `raw`, for any field not shaped above. Text is largely Ukrainian. Accepts the internal 32-char tender id OR a human tenderID (\"UA-2026-09-20-000012-a\") — for a tenderID this now tries to resolve the internal id by scanning the most-recently-modified feed records first (cheap, usually one call for anything modified in the last few hours) and returns FULL detail when that succeeds; it falls back to the search index's summary (detail_available:false, no awards) only when the tender wasn't modified recently enough to be found that way.",
+      "Full detail for a single Ukraine ProZorro tender by id (via the keyless OpenProcurement public API). Returns tenderID, title, description, status, procurementMethod + procurementMethodType (raw OCDS fields — broad method vs ProZorro's specific type, e.g. aboveThresholdUA/aboveThresholdEU), tender_value (the ORIGINAL ASKING PRICE — not money spent), the buyer/procuring entity (name, EDR identifier, region, contact), tender period (start/end), enquiry period, number of bids, line items (description, CPV classification, quantity, unit, relatedLot), `lots` (id/title/status/value, when the tender is lotted), and the OCDS award/contract stage: `award` (operative award: status, date, value, winning supplier, lotID, bid_id — null if none) plus the full `awards` history (each with the FULL `suppliers[]` array — name + identifier scheme/id — alongside the single-supplier `supplier` field kept for backward compatibility), and `contract` (signed contract value/date, with its CURRENT status and amountPaid read from the contract record — the tender's own copy goes stale after signing; use prozorro_get_contract for amendments, termination and contract documents). An `interpretation` line states plainly whether the tender_value was ever actually spent. Pass `raw:true` to also get the complete, unshaped upstream OCDS tender object under `raw`, for any field not shaped above. Text is largely Ukrainian. Accepts the internal 32-char tender id OR a human tenderID (\"UA-2026-09-20-000012-a\") — for a tenderID this now tries to resolve the internal id by scanning the most-recently-modified feed records first (cheap, usually one call for anything modified in the last few hours) and returns FULL detail when that succeeds; it falls back to the search index's summary (detail_available:false, no awards) only when the tender wasn't modified recently enough to be found that way.",
     inputSchema: {
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Tender id — the internal 32-hex id (e.g. "156db6e773ba4b6e925d00f9ad3b13f4") from prozorro_recent_tenders always returns full detail. A human tenderID ("UA-2026-09-20-000012-a") from prozorro_search_tenders is also accepted; full detail depends on whether it can be resolved (see tool description) — detail_available in the response says which case you got.' },
         raw: { type: 'boolean', description: 'Include the complete, unshaped upstream OCDS tender JSON under `raw`. Only applies when full detail is available (detail_available:true). Default false — the raw object can be large (documents, full bids, etc).' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'prozorro_get_contract',
+    description:
+      "The authoritative post-award contract record(s) for a Ukraine ProZorro tender (keyless OpenProcurement contracting API): current status (active | terminated | cancelled), dateSigned, contract period, current value (AFTER amendments — the API does not keep the original signed amount as a separate field; the change rationale usually states it) and amountPaid, terminationDetails, every contract change/amendment (rationale, rationaleTypes, date published, dateSigned), contract documents with their datePublished, and milestones. Use this — not the tender — for anything after signing: the copy of the contract embedded in a tender is frozen when the tender completes and keeps saying `active` after the contract is amended or terminated. Pass a tender id (32-hex or UA-… tenderID) to get all of its contracts, or a contract's 32-hex id. Optional `as_of` (YYYY-MM-DD) splits changes and documents into those published on/before vs after that date and states whether the record's status at that date is known: the public API keeps NO revision history, so if the record was modified after `as_of` the status at `as_of` is reported as not available rather than inferred. The API carries no termination date field; this tool never invents one.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'A tender id (internal 32-hex, e.g. "6a9dca3807a14b37bf82fb8ad2eae0c9", or human tenderID "UA-2026-07-13-009811-a") to return every contract of that tender, or a contract\'s own 32-hex id (the `contract.id` prozorro_get_tender returns).' },
+        as_of: { type: 'string', description: 'Optional cutoff date YYYY-MM-DD (or full ISO timestamp). Separates what was published on or before it from what came later, and says whether the status at that date can be established from the public record.' },
       },
       required: ['id'],
     },
@@ -972,6 +985,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         return await searchOrganizations(args);
       case 'prozorro_get_tender':
         return await getTender(args);
+      case 'prozorro_get_contract':
+        return await getContract(args);
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -1413,7 +1428,7 @@ async function getTenderByHumanId(tenderID: string, raw: boolean, kv: KvLike | u
       const data = (await opGet(`/tenders/${encodeURIComponent(hexId)}`)) as { data?: any };
       if (data.data) {
         return {
-          ...shapeTenderDetail(data.data, raw),
+          ...(await withContractRecordStatus(shapeTenderDetail(data.data, raw))),
           resolved_via: `recent-feed-scan (${stats.recordsScanned} record(s), ${stats.pagesScanned} page(s))`,
         };
       }
@@ -1530,7 +1545,277 @@ async function getTender(args: Record<string, unknown>): Promise<unknown> {
       id,
     };
   }
-  return shapeTenderDetail(d, raw);
+  return withContractRecordStatus(shapeTenderDetail(d, raw));
+}
+
+/**
+ * The tender's embedded contract is frozen at tender completion (see
+ * getContract above), so `contract.status` from the tender alone reported
+ * terminated contracts as active. Overlay the authoritative status from the
+ * contract record — one extra fetch, only when a contract exists — and keep
+ * the embedded value beside it. If the record can't be fetched, say the
+ * status is the embedded copy rather than letting it pass as current.
+ */
+async function withContractRecordStatus(shaped: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const contract = shaped.contract as Record<string, unknown> | null;
+  if (!contract || typeof contract.id !== 'string') return shaped;
+  const embeddedStatus = contract.status;
+  try {
+    const c = await fetchContractRecord(contract.id);
+    if (c?.status) {
+      shaped.contract = {
+        ...contract,
+        status: c.status,
+        status_in_tender_record: embeddedStatus,
+        dateModified: c.dateModified ?? null,
+        amountPaid: shapeValue(c.amountPaid) ?? null,
+        changes_count: Array.isArray(c.changes) ? c.changes.length : 0,
+        note: 'status/amountPaid are from the contract record. For amendments, termination details and contract documents call prozorro_get_contract.',
+      };
+      return shaped;
+    }
+  } catch {
+    /* fall through */
+  }
+  shaped.contract = {
+    ...contract,
+    status_source: 'tender-embedded copy',
+    note: 'This status is the tender\'s embedded copy, frozen when the tender completed; the contract record could not be read just now. prozorro_get_contract returns the authoritative status, amendments and termination details.',
+  };
+  return shaped;
+}
+
+/**
+ * Post-award contract records (fleet #3050, feedback #144).
+ *
+ * A tender's embedded `contracts[]` is a snapshot taken when the tender
+ * completes — after that, the contract lives in OpenProcurement's separate
+ * contracting module at /contracts/{id}, and amendments, terminations and
+ * payments are written THERE only. Measured live 2026-10-14 on
+ * UA-2026-07-13-009811-a / UA-2026-07-13-010730-a / UA-2026-07-30-010486-a:
+ * each tender still embeds its contract as `status: "active"` (tender
+ * dateModified July/August), while /contracts/{id} says `terminated`, with a
+ * signed `volumeCuts` change dated Sep 11 or Sep 29 and amountPaid well under
+ * the signed value. prozorro_get_tender read only the embedded copy, so it
+ * reported three terminated contracts as active — a clean 200 with the wrong
+ * answer.
+ *
+ * What the public API does NOT have, so nothing here pretends otherwise:
+ * revision history (`/tenders/{id}/historical` is 404 on both public hosts),
+ * a termination timestamp (only `status`, `terminationDetails`, `date` and
+ * `dateModified`), and an OCDS `implementation` block (execution is carried
+ * by `amountPaid` and `milestones`).
+ */
+const HEX_ID_RE = /^[0-9a-f]{32}$/i;
+
+function parseAsOf(v: unknown): { cutoff: number; label: string } | undefined {
+  const s = strArg(v);
+  if (!s) return undefined;
+  // A bare date means "through the end of that day, UTC" — stated back to the
+  // caller as `as_of.cutoff` so the boundary is never implicit.
+  const iso = /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T23:59:59.999Z` : s;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) {
+    throw new Error(`user_error: as_of "${s}" is not a date — pass YYYY-MM-DD (e.g. "2026-10-04") or a full ISO timestamp.`);
+  }
+  return { cutoff: t, label: new Date(t).toISOString() };
+}
+
+function onOrBefore(ts: unknown, cutoff: number): boolean | null {
+  if (typeof ts !== 'string') return null;
+  const t = Date.parse(ts);
+  return Number.isFinite(t) ? t <= cutoff : null;
+}
+
+function shapeContractRecord(c: any, embeddedStatus: string | undefined, asOf: { cutoff: number; label: string } | undefined): Record<string, unknown> {
+  const changes = (Array.isArray(c.changes) ? c.changes : []).map((ch: any) => ({
+    id: ch?.id ?? null,
+    status: ch?.status ?? null,
+    rationale: typeof ch?.rationale === 'string' ? ch.rationale.trim() : null,
+    rationaleTypes: Array.isArray(ch?.rationaleTypes) ? ch.rationaleTypes : [],
+    // `date` is when the change was published to ProZorro; `dateSigned` is
+    // the date the parties signed it. They differ, and a study with a cutoff
+    // needs both.
+    date: ch?.date ?? null,
+    dateSigned: ch?.dateSigned ?? null,
+    contractNumber: ch?.contractNumber ?? null,
+  }));
+  const documents = (Array.isArray(c.documents) ? c.documents : []).map((d: any) => ({
+    title: d?.title ?? null,
+    documentType: d?.documentType ?? null,
+    datePublished: d?.datePublished ?? null,
+    dateModified: d?.dateModified ?? null,
+    format: d?.format ?? null,
+    url: d?.url ?? null,
+  }));
+  const status = c.status ?? null;
+  const out: Record<string, unknown> = {
+    id: c.id ?? null,
+    contractID: c.contractID ?? null,
+    contractNumber: c.contractNumber ?? null,
+    tender_id: c.tender_id ?? null,
+    awardID: c.awardID ?? null,
+    title: c.title ?? null,
+    status,
+    status_in_tender_record: embeddedStatus ?? null,
+    dateSigned: c.dateSigned ?? null,
+    dateCreated: c.dateCreated ?? null,
+    dateModified: c.dateModified ?? null,
+    // OpenProcurement's own `date` field, passed through as-is. It is NOT
+    // documented as a termination date and is not labelled as one here.
+    date: c.date ?? null,
+    period: shapePeriod(c.period) ?? null,
+    // CURRENT value, after any changes below — not the amount originally
+    // signed (the API overwrites it; measured on UA-2026-07-13-010730-a:
+    // 14,376.96 now, 70,200 at signing per the change rationale).
+    value: shapeValue(c.value) ?? null,
+    amountPaid: shapeValue(c.amountPaid) ?? null,
+    terminationDetails: typeof c.terminationDetails === 'string' ? c.terminationDetails.trim() || null : null,
+    buyer: c.buyer ? { name: c.buyer.name ?? c.buyer.identifier?.legalName ?? null, edrpou: c.buyer.identifier?.id ?? null } : null,
+    suppliers: (Array.isArray(c.suppliers) ? c.suppliers : []).map((s: any) => ({
+      name: s?.name ?? s?.identifier?.legalName ?? null,
+      edrpou: s?.identifier?.id ?? null,
+    })),
+    changes,
+    documents,
+    milestones: (Array.isArray(c.milestones) ? c.milestones : []).map((m: any) => ({
+      title: m?.title ?? null,
+      code: m?.code ?? null,
+      type: m?.type ?? null,
+      status: m?.status ?? null,
+      percentage: m?.percentage ?? null,
+      dueDate: m?.dueDate ?? null,
+      dateMet: m?.dateMet ?? null,
+    })),
+  };
+  if (embeddedStatus && status && embeddedStatus !== status) {
+    out.status_note =
+      `The tender record still embeds this contract as "${embeddedStatus}"; the contract record itself says "${status}". ` +
+      'The embedded copy is frozen when the tender completes — this contract record is the authoritative one.';
+  }
+  if (status === 'terminated') {
+    out.termination_note =
+      'Status is terminated. The public API carries NO termination timestamp: dateModified is only when this record was last ' +
+      'changed, and the change/document dates above are when those were published or signed. Any termination date beyond those is not in the record.';
+  }
+  if (asOf) {
+    const createdBefore = onOrBefore(c.dateCreated, asOf.cutoff);
+    const modifiedBefore = onOrBefore(c.dateModified, asOf.cutoff);
+    const changesBefore = changes.filter((ch: any) => onOrBefore(ch.date, asOf.cutoff) === true);
+    const changesAfter = changes.filter((ch: any) => onOrBefore(ch.date, asOf.cutoff) !== true);
+    const docsBefore = documents.filter((d: any) => onOrBefore(d.datePublished, asOf.cutoff) === true);
+    const docsAfter = documents.filter((d: any) => onOrBefore(d.datePublished, asOf.cutoff) !== true);
+    let statusAtAsOf: string | null;
+    let basis: string;
+    if (createdBefore === false) {
+      statusAtAsOf = null;
+      basis = `NOT_PUBLISHED: this contract record was created ${c.dateCreated}, after the cutoff — it was not public at ${asOf.label}.`;
+    } else if (modifiedBefore === true) {
+      statusAtAsOf = status;
+      basis = `ESTABLISHED: the record was last modified ${c.dateModified}, on or before the cutoff, so its current state is its state at ${asOf.label}.`;
+    } else {
+      statusAtAsOf = null;
+      basis =
+        `NOT_AVAILABLE: the record was modified after the cutoff (dateModified ${c.dateModified}) and the public OpenProcurement API keeps no revision history, ` +
+        'so the status at the cutoff cannot be read from it. The dated changes and documents split below are what the record can establish.';
+    }
+    out.as_of = {
+      cutoff: asOf.label,
+      status_at_as_of: statusAtAsOf,
+      basis,
+      changes_published_on_or_before: changesBefore.length,
+      changes_published_after: changesAfter.length,
+      documents_published_on_or_before: docsBefore.length,
+      documents_published_after: docsAfter.map((d: any) => ({ title: d.title, documentType: d.documentType, datePublished: d.datePublished })),
+    };
+  }
+  return out;
+}
+
+async function fetchContractRecord(contractId: string): Promise<any> {
+  const data = (await opGet(`/contracts/${encodeURIComponent(contractId)}`)) as { data?: any };
+  return data.data ?? null;
+}
+
+const CONTRACT_SOURCE =
+  'ProZorro contracting module, OpenProcurement public API 2.5 (/contracts/{id}) — the post-award record; amendments, terminations and payments are written here, not to the tender.';
+
+async function getContract(args: Record<string, unknown>): Promise<unknown> {
+  const id = reqIdArg(args, 'id', '6a9dca3807a14b37bf82fb8ad2eae0c9');
+  const asOf = parseAsOf(args.as_of);
+  const kv = kvFromArgs(args);
+
+  let tenderHex: string | undefined;
+  if (TENDER_ID_RE.test(id)) {
+    const { resolved, recordsScanned, oldestScanned } = await resolveTenderIdsFromFeed(new Set([id]), { kv });
+    tenderHex = resolved.get(id.toUpperCase());
+    if (!tenderHex) {
+      return {
+        error: 'not_found',
+        message:
+          `"${id}" is a ProZorro tenderID; contract records need the tender's internal 32-character id. I scanned the ` +
+          `${recordsScanned} most-recently-modified ProZorro records${oldestScanned ? ` (back to ${oldestScanned})` : ''} and it was not among them, ` +
+          'so it could not be resolved here. This does not mean the tender has no contract. Pass the 32-hex tender id (shown on the tender page at prozorro.gov.ua) or the contract id.',
+        id,
+      };
+    }
+  } else if (!HEX_ID_RE.test(id)) {
+    throw new Error(`user_error: "${id}" is neither a 32-character ProZorro id nor a UA-… tenderID.`);
+  }
+
+  // A 32-hex id may name a tender or a contract — the two id spaces look the
+  // same. Try it as a tender first (the common input), then as a contract.
+  let tender: any = null;
+  try {
+    tender = ((await opGet(`/tenders/${encodeURIComponent(tenderHex ?? id)}`)) as { data?: any }).data ?? null;
+  } catch (e) {
+    if (tenderHex || !(e instanceof Error) || !e.message.startsWith('not_found')) throw e;
+  }
+
+  if (!tender) {
+    let c: any;
+    try {
+      c = await fetchContractRecord(id);
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith('not_found')) {
+        return { error: 'not_found', message: `No ProZorro tender or contract with id "${id}".`, id };
+      }
+      throw e;
+    }
+    if (!c) return { error: 'not_found', message: `No ProZorro tender or contract with id "${id}".`, id };
+    return { id, source: CONTRACT_SOURCE, contracts: [shapeContractRecord(c, undefined, asOf)] };
+  }
+
+  const embedded: any[] = Array.isArray(tender.contracts) ? tender.contracts : [];
+  const contracts = await Promise.all(
+    embedded.map(async (ec) => {
+      try {
+        const c = await fetchContractRecord(ec.id);
+        if (c) return shapeContractRecord(c, ec.status, asOf);
+      } catch {
+        /* fall through to the embedded copy, labelled as such */
+      }
+      return {
+        id: ec.id ?? null,
+        contractID: ec.contractID ?? null,
+        status: null,
+        status_in_tender_record: ec.status ?? null,
+        record_available: false,
+        note: 'The contract record could not be fetched just now; only the tender\'s embedded copy is available, and that copy does not reflect amendments or termination. Retry for the authoritative status.',
+      };
+    }),
+  );
+  return {
+    id,
+    tender_id: tender.id,
+    tenderID: tender.tenderID,
+    tender_status: tender.status ?? null,
+    tender_dateModified: tender.dateModified ?? null,
+    source: CONTRACT_SOURCE,
+    count: contracts.length,
+    ...(contracts.length === 0 ? { note: `Tender ${tender.tenderID} has no contract — it never reached the contract stage (status: ${tender.status}).` } : {}),
+    contracts,
+  };
 }
 
 /**
