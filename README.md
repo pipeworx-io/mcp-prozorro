@@ -1,18 +1,39 @@
-# mcp-prozorro
+# @pipeworx/prozorro
 
-ProZorro MCP — Ukraine government procurement (keyless).
+Ukraine's national public procurement system — tender search, full OCDS
+detail (buyer, value, awards, contracts), and best-effort resolution for
+historical tenders too old for the live feed to reach directly.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1800+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `prozorro_recent_tenders` | Most recently updated tenders from Ukraine's ProZorro national procurement system (via the keyless OpenProcurement public feed). Returns each tender with id, tenderID, title, value (amount+currency, usually UAH), buyer (procuring entity), status, and procurement method. Titles and buyer names are in Ukrainian. Use for browsing current Ukrainian public tenders; for a specific tender use prozorro_get_tender. |
-| `prozorro_search_tenders` | Full-text search over ALL Ukraine ProZorro tenders back to 2015 (keyless). Searches ProZorro's own analyzed index, so Ukrainian queries stem correctly ("школа" also matches "школи", "шкільний") — pass Ukrainian keywords for best recall. Filter by buyer EDRPOU, by SUPPLIER/bidder EDRPOU (`tenderer` — this is the one for supplier due diligence: every tender a company has bid on or won), CPV code, status, value range, and date. Returns tenderID, title, value, buyer name + EDRPOU + region, status, and an `id` field (internal 32-hex id) that is NULL unless `resolve_ids` is passed — the search index itself never carries it (verified live); prozorro_get_tender with just the tenderID now attempts the same resolution automatically, so you usually don't need `resolve_ids` here. Use prozorro_get_tender for the full detail of one result. |
-| `prozorro_search_organizations` | Resolve a Ukrainian company or public buyer NAME to its EDRPOU code, using ProZorro's organization index (keyless). This is the entry point for supplier due diligence: a user knows the company's name, but prozorro_search_tenders filters by EDRPOU — call this first, then pass the returned `edrpou` as `tenderer` (supplier side) or `buyer` to get that company's full tender history. |
-| `prozorro_get_tender` | Full detail for a single Ukraine ProZorro tender by id (via the keyless OpenProcurement public API). Returns tenderID, title, description, status, procurementMethod + procurementMethodType (raw OCDS fields — broad method vs ProZorro's specific type, e.g. aboveThresholdUA/aboveThresholdEU), tender_value (the ORIGINAL ASKING PRICE — not money spent), the buyer/procuring entity (name, EDR identifier, region, contact), tender period (start/end), enquiry period, number of bids, line items (description, CPV classification, quantity, unit, relatedLot), `lots` (id/title/status/value, when the tender is lotted), and the OCDS award/contract stage: `award` (operative award: status, date, value, winning supplier, lotID, bid_id — null if none) plus the full `awards` history (each with the FULL `suppliers[]` array — name + identifier scheme/id — alongside the single-supplier `supplier` field kept for backward compatibility), and `contract` (signed contract value/date, with its CURRENT status and amountPaid read from the contract record — the tender's own copy goes stale after signing; use prozorro_get_contract for amendments, termination and contract documents). An `interpretation` line states plainly whether the tender_value was ever actually spent. Pass `raw:true` to also get the complete, unshaped upstream OCDS tender object under `raw`, for any field not shaped above. Text is largely Ukrainian. Accepts the internal 32-char tender id OR a human tenderID ("UA-2026-09-20-000012-a") — for a tenderID this now tries to resolve the internal id by scanning the most-recently-modified feed records first (cheap, usually one call for anything modified in the last few hours) and returns FULL detail when that succeeds; it falls back to the search index's summary (detail_available:false, no awards) only when the tender wasn't modified recently enough to be found that way. |
-| `prozorro_get_contract` | The authoritative post-award contract record(s) for a Ukraine ProZorro tender (keyless OpenProcurement contracting API): current status (active \| terminated \| cancelled), dateSigned, contract period, current value (AFTER amendments — the API does not keep the original signed amount as a separate field; the change rationale usually states it) and amountPaid, terminationDetails, every contract change/amendment (rationale, rationaleTypes, date published, dateSigned), contract documents with their datePublished, and milestones. Use this — not the tender — for anything after signing: the copy of the contract embedded in a tender is frozen when the tender completes and keeps saying `active` after the contract is amended or terminated. Pass a tender id (32-hex or UA-… tenderID) to get all of its contracts, or a contract's 32-hex id. Optional `as_of` (YYYY-MM-DD) splits changes and documents into those published on/before vs after that date and states whether the record's status at that date is known: the public API keeps NO revision history, so if the record was modified after `as_of` the status at `as_of` is reported as not available rather than inferred. The API carries no termination date field; this tool never invents one. |
+- `prozorro_recent_tenders(limit?)` — the most recently updated tenders from the live change-feed.
+- `prozorro_search_tenders(query?, tenderer?, buyer?, cpv?, status?, date_from?, date_to?, sort_by?, order?, page?, resolve_ids?)` — full-text search over all tenders back to 2015, keyless. A date range ALONE (no other filter) is a valid call and is the only live way to browse tenders by historical date — e.g. `date_from:"2015-03-01", date_to:"2015-03-10"`.
+- `prozorro_search_organizations(name, role?)` — resolve a company/buyer name to its EDRPOU code.
+- `prozorro_get_tender(id, raw?)` — full detail for one tender (title, value, buyer, periods, line items, awards, contract). Fast for an internal 32-hex id; bounded for a human tenderID (recently-modified window only — see `prozorro_historical_release` for a second attempt on an older one).
+- `prozorro_get_contract(id, as_of?)` — the authoritative post-award contract record(s), since a tender's own embedded copy goes stale after signing.
+- `prozorro_historical_release(id)` — for a human tenderID `prozorro_get_tender` can't resolve, tries a second live strategy (see Notes) before honestly reporting a search-index summary only.
+
+Every response is classified (`not_found` / `upstream_throttled` / `upstream_down` / `user_error`) on an upstream failure, and a tender id that can't be resolved to full detail always carries `detail_available: false` with whatever summary fields ARE known — never a bare empty object.
+
+## Auth
+
+Keyless.
+
+## Data sources
+
+- ProZorro / OpenProcurement, Ukraine public procurement register — tender and contract detail, and the full-text search index.
+
+## Notes for the next person
+
+**The 60 req/min search budget is shared** between `prozorro_search_tenders` and `prozorro_search_organizations` on the same upstream host — see the file header for the KV cache-aside and bounded retry that absorb it.
+
+**`prozorro_get_tender`'s tenderID→internal-id resolution is bounded to recently-modified tenders** (it scans the change-feed, which has no date-seek for an arbitrary bulk walk). An OLD tenderID — one found via `prozorro_search_tenders`'s date-range browsing, say — comes back `detail_available:false` from that tool.
+
+**`prozorro_historical_release` adds a SECOND, independent live attempt for exactly that case, with no stored data at all (fleet #3244):** it seeks the same feed to the date the tenderID ITSELF ENCODES ("UA-2015-02-16-..." → search from 2015-02-16) and scans forward a bounded distance for an exact match. This works when the tender's last modification happened reasonably soon after that date, and misses when a later amendment moved it far down the feed — there is no live way to know that drift in advance, so this is a genuinely unreliable-by-design second attempt, cheap when it hits, honestly reported as a miss when it doesn't (`detail_available: false`, never a crash, never empty). A CONSTRUCTED feed offset — not one the API itself handed back — in the shape `<unix_ts>.0.1.<32-char suffix>` IS honoured as a real date seek (verified live); a garbage-shaped offset is rejected outright (HTTP 400). This capability was found and used here specifically because it does NOT require persisting anything.
+
+**A date filter on `prozorro_search_tenders` drops any matching record with no tender period** — combined with a keyword/tenderer/buyer it can hide real matches; used alone it is reliable (verified live: a bare 10-day 2015 window returns a correctly-dated, narrow result set, not the unfiltered corpus — the upstream's own silent-ignore trap applies to a MISSHAPED param, not a present one).
 
 ## Quick Start
 
@@ -58,7 +79,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1800+ data sources. The
+Both URLs reach the same gateway and the same 1856+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
@@ -72,10 +93,12 @@ curl -X POST https://gateway.pipeworx.io/v1/tools/prozorro_recent_tenders \
 
 No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/prozorro_recent_tenders`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
 
-## Standalone (no gateway account)
+## Run it from npm
 
-This package also runs as a local stdio MCP server — no Pipeworx account, no
-gateway round-trip:
+`@pipeworx/mcp-prozorro` is a local stdio bridge to the Pipeworx gateway: your MCP client
+starts it with `npx`, and it forwards every call to the same
+`https://gateway.pipeworx.io/prozorro/mcp` endpoint shown above. It needs network access;
+there is no offline mode.
 
 ```json
 {
@@ -88,15 +111,18 @@ gateway round-trip:
 }
 ```
 
-Or run it directly to confirm it starts:
+Without a key it calls anonymously, capped at 50 calls a day. A free account
+raises that to 200 a day: get a key at https://pipeworx.io/signup and add
+`"env": { "PIPEWORX_API_KEY": "<your key>" }` to the server entry.
+The key is sent as a Bearer token, the same way a hosted connection sends it,
+so calls are metered and billed exactly as they are there.
 
-```bash
-npx -y @pipeworx/mcp-prozorro
-```
+It lists **only** this pack's tools by default. Set `PIPEWORX_META_TOOLS=1` to
+also list `ask_pipeworx` and the other gateway-wide tools.
 
-It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
-for **only** this pack's tools — none of the shared meta-tools the gateway
-connection above adds. Same source, same tools, no ask_pipeworx routing.
+Behind an HTTPS proxy: Node's built-in `fetch` does not read `HTTPS_PROXY` by
+default. Newer Node releases honour it when `NODE_USE_ENV_PROXY=1` is set; check
+your Node version's documentation.
 
 ## Using with ask_pipeworx
 
